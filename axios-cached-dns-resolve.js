@@ -1,44 +1,30 @@
 /* eslint-disable no-plusplus */
-import dns from 'dns'
-import URL from 'url'
-import net from 'net'
-import stringify from 'json-stringify-safe'
-import LRUCache from 'lru-cache'
-import util from 'util'
-import { init as initLogger } from './logging.js'
+const dns = require('dns');
+const URL = require('url');
+const net = require('net');
+const stringify = require('json-stringify-safe');
+const LRUCache = require('lru-cache');
+const util = require('util');
 
-const dnsResolve = util.promisify(dns.resolve)
-const dnsLookup = util.promisify(dns.lookup)
+// const dnsResolve = util.promisify(dns.resolve);
+const dnsLookup = util.promisify(dns.lookup);
 
-export const config = {
+const config = {
   disabled: process.env.AXIOS_DNS_DISABLE === 'true',
-  dnsTtlMs: process.env.AXIOS_DNS_CACHE_TTL_MS || 5000, // when to refresh actively used dns entries (5 sec)
-  cacheGraceExpireMultiplier: process.env.AXIOS_DNS_CACHE_EXPIRE_MULTIPLIER || 2, // maximum grace to use entry beyond TTL
-  dnsIdleTtlMs: process.env.AXIOS_DNS_CACHE_IDLE_TTL_MS || 1000 * 60 * 60, // when to remove entry entirely if not being used (1 hour)
-  backgroundScanMs: process.env.AXIOS_DNS_BACKGROUND_SCAN_MS || 2400, // how frequently to scan for expired TTL and refresh (2.4 sec)
-  dnsCacheSize: process.env.AXIOS_DNS_CACHE_SIZE || 100, // maximum number of entries to keep in cache
-  // pino logging options
-  logging: {
-    name: 'axios-cache-dns-resolve',
-    // enabled: true,
-    level: process.env.AXIOS_DNS_LOG_LEVEL || 'info', // default 'info' others trace, debug, info, warn, error, and fatal
-    // timestamp: true,
-    prettyPrint: process.env.NODE_ENV === 'DEBUG' || false,
-    formatters: {
-      level(label/* , number */) {
-        return { level: label }
-      },
-    },
-  },
+  dnsTtlMs: process.env.AXIOS_DNS_CACHE_TTL_MS || 5000,
+  cacheGraceExpireMultiplier: process.env.AXIOS_DNS_CACHE_EXPIRE_MULTIPLIER || 2,
+  dnsIdleTtlMs: process.env.AXIOS_DNS_CACHE_IDLE_TTL_MS || 1000 * 60 * 60,
+  backgroundScanMs: process.env.AXIOS_DNS_BACKGROUND_SCAN_MS || 2400,
+  dnsCacheSize: process.env.AXIOS_DNS_CACHE_SIZE || 100,
   cache: undefined,
-}
+};
 
-export const cacheConfig = {
+const cacheConfig = {
   max: config.dnsCacheSize,
-  ttl: (config.dnsTtlMs * config.cacheGraceExpireMultiplier), // grace for refresh
-}
+  ttl: config.dnsTtlMs * config.cacheGraceExpireMultiplier,
+};
 
-export const stats = {
+const stats = {
   dnsEntries: 0,
   refreshed: 0,
   hits: 0,
@@ -47,185 +33,176 @@ export const stats = {
   errors: 0,
   lastError: 0,
   lastErrorTs: 0,
+};
+
+let log;
+let backgroundRefreshId;
+let cachePruneId;
+
+init();
+
+function init() {
+  log = console;
+
+  if (config.cache) return;
+
+  config.cache = new LRUCache(cacheConfig);
+
+  startBackgroundRefresh();
+  startPeriodicCachePrune();
+  cachePruneId = setInterval(() => config.cache.purgeStale(), config.dnsIdleTtlMs);
 }
 
-let log
-let backgroundRefreshId
-let cachePruneId
-
-init()
-
-export function init() {
-  log = initLogger(config.logging)
-
-  if (config.cache) return
-
-  config.cache = new LRUCache(cacheConfig)
-
-  startBackgroundRefresh()
-  startPeriodicCachePrune()
-  cachePruneId = setInterval(() => config.cache.purgeStale(), config.dnsIdleTtlMs)
+function reset() {
+  if (backgroundRefreshId) clearInterval(backgroundRefreshId);
+  if (cachePruneId) clearInterval(cachePruneId);
 }
 
-export function reset() {
-  if (backgroundRefreshId) clearInterval(backgroundRefreshId)
-  if (cachePruneId) clearInterval(cachePruneId)
+function startBackgroundRefresh() {
+  if (backgroundRefreshId) clearInterval(backgroundRefreshId);
+  backgroundRefreshId = setInterval(backgroundRefresh, config.backgroundScanMs);
 }
 
-export function startBackgroundRefresh() {
-  if (backgroundRefreshId) clearInterval(backgroundRefreshId)
-  backgroundRefreshId = setInterval(backgroundRefresh, config.backgroundScanMs)
+function startPeriodicCachePrune() {
+  if (cachePruneId) clearInterval(cachePruneId);
+  cachePruneId = setInterval(() => config.cache.purgeStale(), config.dnsIdleTtlMs);
 }
 
-export function startPeriodicCachePrune() {
-  if (cachePruneId) clearInterval(cachePruneId)
-  cachePruneId = setInterval(() => config.cache.purgeStale(), config.dnsIdleTtlMs)
+function getStats() {
+  stats.dnsEntries = config.cache.size;
+  return stats;
 }
 
-export function getStats() {
-  stats.dnsEntries = config.cache.size
-  return stats
+function getDnsCacheEntries() {
+  return Array.from(config.cache.values());
 }
 
-export function getDnsCacheEntries() {
-  return Array.from(config.cache.values())
-}
-
-// const dnsEntry = {
-//   host: 'www.amazon.com',
-//   ips: [
-//     '52.54.40.141',
-//     '34.205.98.207',
-//     '3.82.118.51',
-//   ],
-//   nextIdx: 0,
-//   lastUsedTs: 1555771516581, Date.now()
-//   updatedTs: 1555771516581,
-// }
-
-export function registerInterceptor(axios) {
-  if (config.disabled || !axios || !axios.interceptors) return // supertest
+function registerInterceptor(axios) {
+  if (config.disabled || !axios || !axios.interceptors) return;
   axios.interceptors.request.use(async (reqConfig) => {
     try {
-      let url
+      let url;
       if (reqConfig.baseURL) {
-        url = URL.parse(reqConfig.baseURL)
+        url = URL.parse(reqConfig.baseURL);
       } else {
-        url = URL.parse(reqConfig.url)
+        url = URL.parse(reqConfig.url);
       }
 
-      if (net.isIP(url.hostname)) return reqConfig // skip
+      if (net.isIP(url.hostname)) return reqConfig;
 
-      reqConfig.headers.Host = url.hostname // set hostname in header
+      reqConfig.headers.Host = url.hostname;
 
-      url.hostname = await getAddress(url.hostname)
-      delete url.host // clear hostname
+      url.hostname = await getAddress(url.hostname);
+      delete url.host;
 
       if (reqConfig.baseURL) {
-        reqConfig.baseURL = URL.format(url)
+        reqConfig.baseURL = URL.format(url);
       } else {
-        reqConfig.url = URL.format(url)
+        reqConfig.url = URL.format(url);
       }
     } catch (err) {
-      recordError(err, `Error getAddress, ${err.message}`)
+      recordError(err, `Error getAddress, ${err.message}`);
     }
 
-    return reqConfig
-  })
+    return reqConfig;
+  });
 }
 
-export async function getAddress(host) {
-  let dnsEntry = config.cache.get(host)
+async function getAddress(host) {
+  let dnsEntry = config.cache.get(host);
   if (dnsEntry) {
-    ++stats.hits
-    dnsEntry.lastUsedTs = Date.now()
-    // eslint-disable-next-line no-plusplus
-    const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length] // round-robin
-    config.cache.set(host, dnsEntry)
-    return ip
+    ++stats.hits;
+    dnsEntry.lastUsedTs = Date.now();
+    const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length];
+    config.cache.set(host, dnsEntry);
+    return ip;
   }
-  ++stats.misses
-  if (log.isLevelEnabled('debug')) log.debug(`cache miss ${host}`)
+  ++stats.misses;
+  log.debug(`cache miss ${host}`);
 
-  const ips = await resolve(host)
+  const ips = await resolve(host);
   dnsEntry = {
     host,
     ips,
     nextIdx: 0,
     lastUsedTs: Date.now(),
     updatedTs: Date.now(),
-  }
-  // eslint-disable-next-line no-plusplus
-  const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length] // round-robin
-  config.cache.set(host, dnsEntry)
-  return ip
+  };
+  const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length];
+  config.cache.set(host, dnsEntry);
+  return ip;
 }
 
-let backgroundRefreshing = false
-export async function backgroundRefresh() {
-  if (backgroundRefreshing) return // don't start again if currently iterating slowly
-  backgroundRefreshing = true
+let backgroundRefreshing = false;
+async function backgroundRefresh() {
+  if (backgroundRefreshing) return;
+  backgroundRefreshing = true;
   try {
     config.cache.forEach(async (value, key) => {
       try {
         if (value.updatedTs + config.dnsTtlMs > Date.now()) {
-          return // continue/skip
+          return;
         }
         if (value.lastUsedTs + config.dnsIdleTtlMs <= Date.now()) {
-          ++stats.idleExpired
-          config.cache.delete(key)
-          return // continue
+          ++stats.idleExpired;
+          config.cache.delete(key);
+          return;
         }
 
-        const ips = await resolve(value.host)
-        value.ips = ips
-        value.updatedTs = Date.now()
-        config.cache.set(key, value)
-        ++stats.refreshed
+        const ips = await resolve(value.host);
+        value.ips = ips;
+        value.updatedTs = Date.now();
+        config.cache.set(key, value);
+        ++stats.refreshed;
       } catch (err) {
-        // best effort
-        recordError(err, `Error backgroundRefresh host: ${key}, ${stringify(value)}, ${err.message}`)
+        recordError(err, `Error backgroundRefresh host: ${key}, ${stringify(value)}, ${err.message}`);
       }
-    })
+    });
   } catch (err) {
-    // best effort
-    recordError(err, `Error backgroundRefresh, ${err.message}`)
+    recordError(err, `Error backgroundRefresh, ${err.message}`);
   } finally {
-    backgroundRefreshing = false
+    backgroundRefreshing = false;
   }
 }
 
-/**
- *
- * @param host
- * @returns {*[]}
- */
 async function resolve(host) {
-  let ips
+  let ips;
   try {
-    ips = await dnsResolve(host)
-  } catch (e) {
-    let lookupResp = await dnsLookup(host, { all: true }) // pass options all: true for all addresses
-    lookupResp = extractAddresses(lookupResp)
-    if (!Array.isArray(lookupResp) || lookupResp.length < 1) throw new Error(`fallback to dnsLookup returned no address ${host}`)
-    ips = lookupResp
+    let lookupResp = await dnsLookup(host, { all: true });
+    lookupResp = extractAddresses(lookupResp);
+    if (!Array.isArray(lookupResp) || lookupResp.length < 1) throw new Error(`fallback to dnsLookup returned no address ${host}`);
+    ips = lookupResp;
+  } catch (e) {  
+     log.error(e.message)
+     throw e;
   }
-  return ips
+  return ips;
 }
-
-// dns.lookup
-// ***************** { address: '142.250.190.68', family: 4 }
-// , { all: true } /***************** [ { address: '142.250.190.68', family: 4 } ]
 
 function extractAddresses(lookupResp) {
-  if (!Array.isArray(lookupResp)) throw new Error('lookup response did not contain array of addresses')
-  return lookupResp.filter((e) => e.address != null).map((e) => e.address)
+  if (!Array.isArray(lookupResp)) throw new Error('lookup response did not contain array of addresses');
+  return lookupResp.filter((e) => e.address != null).map((e) => e.address);
 }
 
 function recordError(err, errMesg) {
-  ++stats.errors
-  stats.lastError = err
-  stats.lastErrorTs = new Date().toISOString()
-  log.error(err, errMesg)
+  ++stats.errors;
+  stats.lastError = err;
+  stats.lastErrorTs = new Date().toISOString();
+  log.error(err, errMesg);
 }
 /* eslint-enable no-plusplus */
+
+module.exports = {
+  config,
+  cacheConfig,
+  stats,
+  init,
+  reset,
+  startBackgroundRefresh,
+  startPeriodicCachePrune,
+  getStats,
+  getDnsCacheEntries,
+  registerInterceptor,
+  getAddress,
+  backgroundRefresh,
+};
