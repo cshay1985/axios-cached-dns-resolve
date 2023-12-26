@@ -113,6 +113,12 @@ async function getAddress(host) {
   if (dnsEntry) {
     ++stats.hits;
     dnsEntry.lastUsedTs = Date.now();
+    const ipv4 = dnsEntry.ips.filter(net.isIPv4);
+    if (ipv4.length > 0) {
+      return ipv4[dnsEntry.nextIdx++ % ipv4.length];
+    }
+    
+    log.debug('cache returned empty ipv4 list, falling back to ipv6')
     const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length];
     config.cache.set(host, dnsEntry);
     return ip;
@@ -128,6 +134,12 @@ async function getAddress(host) {
     lastUsedTs: Date.now(),
     updatedTs: Date.now(),
   };
+  const ipv4 = dnsEntry.ips.filter(net.isIPv4);
+  if (ipv4.length > 0) {
+    return ipv4[dnsEntry.nextIdx++ % ipv4.length];
+  }
+
+  log.debug('cache returned empty ipv4 list, falling back to ipv6')
   const ip = dnsEntry.ips[dnsEntry.nextIdx++ % dnsEntry.ips.length];
   config.cache.set(host, dnsEntry);
   return ip;
